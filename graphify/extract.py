@@ -110,26 +110,14 @@ def _resolve_ts_import_path(raw_import: str, file_path: str) -> str | None:
     root: Path = tsconfig["root"]
 
     def _try_resolve(resolved: Path) -> str | None:
-        """Try common TS/JS extensions and index files, return relative path or None."""
+        """Try common TS/JS extensions and index files, return absolute path or None."""
         for ext in (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"):
             candidate = Path(str(resolved) + ext)
             if candidate.exists() and candidate.is_file():
-                try:
-                    return str(candidate.relative_to(root))
-                except ValueError:
-                    try:
-                        return str(candidate.relative_to(base_url))
-                    except ValueError:
-                        return str(candidate)
+                return str(candidate.resolve())
         # Exact match (already has extension)
         if resolved.exists() and resolved.is_file():
-            try:
-                return str(resolved.relative_to(root))
-            except ValueError:
-                try:
-                    return str(resolved.relative_to(base_url))
-                except ValueError:
-                    return str(resolved)
+            return str(resolved.resolve())
         return None
 
     # 1. Try path alias matching (e.g., @api/* → lib/api/src/*)
@@ -711,8 +699,18 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                             "weight": 1.0,
                         })
             elif dec_name in ("Injectable", "Controller", "Resolver", "Gateway"):
-                # Mark the class with a decorator_type edge to a virtual node
+                # Mark the class with a decorator_type edge to a virtual framework node
                 dec_type_nid = _make_id(f"nestjs_{dec_name.lower()}")
+                # Create the virtual framework node if not already seen
+                if dec_type_nid not in seen_ids:
+                    seen_ids.add(dec_type_nid)
+                    nodes.append({
+                        "id": dec_type_nid,
+                        "label": f"@{dec_name}",
+                        "file_type": "code",
+                        "source_file": "nestjs/framework",
+                        "source_location": None,
+                    })
                 edges.append({
                     "source": class_nid,
                     "target": dec_type_nid,
@@ -3137,6 +3135,34 @@ def _resolve_cross_file_imports_ts(
                             "relation": "injects",
                             "confidence": "INFERRED",
                             "confidence_score": 0.9,
+                            "source_file": str_path,
+                            "source_location": edge.get("source_location", ""),
+                            "weight": 1.0,
+                        })
+                    break
+
+        # Resolve @Module wiring edges (provides, exports_service, exposes_controller)
+        # These are created with tgt_nid = _make_id(module_stem, ClassName) but the
+        # actual target lives in its own file with tgt_nid = _make_id(service_stem, ClassName)
+        _MODULE_WIRING_RELATIONS = ("provides", "exports_service", "exposes_controller")
+        for edge in file_result.get("edges", []):
+            if edge.get("relation") not in _MODULE_WIRING_RELATIONS:
+                continue
+            src_nid = edge["source"]
+            tgt_nid = edge["target"]
+            # Target was created as _make_id(module_stem, ClassName)
+            # Find the matching class name in global_name_to_nid
+            for name, nid in global_name_to_nid.items():
+                if _make_id(Path(str_path).stem, name) == tgt_nid and nid != tgt_nid:
+                    pair = (src_nid, nid)
+                    if pair not in existing_pairs:
+                        existing_pairs.add(pair)
+                        new_edges.append({
+                            "source": src_nid,
+                            "target": nid,
+                            "relation": edge["relation"],
+                            "confidence": "EXTRACTED",
+                            "confidence_score": 1.0,
                             "source_file": str_path,
                             "source_location": edge.get("source_location", ""),
                             "weight": 1.0,
