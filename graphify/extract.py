@@ -305,6 +305,20 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                     resolved = resolved.with_suffix(".ts")
                 elif resolved.suffix == ".jsx":
                     resolved = resolved.with_suffix(".tsx")
+                # If file doesn't exist as-is, try appending .ts/.tsx or /index.ts
+                if not (resolved.exists() and resolved.is_file()):
+                    for ext in (".ts", ".tsx", ".js", ".jsx"):
+                        candidate = Path(str(resolved) + ext)
+                        if candidate.exists() and candidate.is_file():
+                            resolved = candidate
+                            break
+                    else:
+                        # Try index file in directory
+                        for idx in ("index.ts", "index.tsx", "index.js"):
+                            candidate = resolved / idx
+                            if candidate.exists() and candidate.is_file():
+                                resolved = candidate
+                                break
                 tgt_nid = _make_id(str(resolved))
             else:
                 # Try tsconfig path alias / baseUrl resolution first
