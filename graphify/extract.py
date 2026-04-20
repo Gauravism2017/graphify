@@ -3069,6 +3069,11 @@ def _resolve_cross_file_imports_ts(
     # Pass 2: for each file, find import edges and resolve imported names
     new_edges: list[dict] = []
     existing_pairs: set[tuple[str, str]] = set()
+    # DI injects edges use a separate dedup set because they are semantically
+    # distinct from "uses" edges (constructor dependency vs file-level import).
+    # Without this, the uses-resolution pass populates existing_pairs first and
+    # then silently blocks the more specific injects edges for the same pair.
+    existing_injects_pairs: set[tuple[str, str]] = set()
 
     for file_result, path in zip(per_file, paths):
         str_path = str(path)
@@ -3124,8 +3129,8 @@ def _resolve_cross_file_imports_ts(
                 if _make_id(Path(str_path).stem, name) == tgt_nid and nid != tgt_nid:
                     # Found the real target in another file
                     pair = (src_nid, nid)
-                    if pair not in existing_pairs:
-                        existing_pairs.add(pair)
+                    if pair not in existing_injects_pairs:
+                        existing_injects_pairs.add(pair)
                         new_edges.append({
                             "source": src_nid,
                             "target": nid,
