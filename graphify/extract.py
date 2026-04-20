@@ -1162,6 +1162,9 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         })
 
     file_nid = _make_id(str(path))
+    # Register file_nid in seen_ids so import edges (source=file_nid) pass edge cleanup,
+    # but do NOT add it as a node to the graph.
+    seen_ids.add(file_nid)
 
     def walk(node, parent_class_nid: str | None = None) -> None:
         t = node.type
