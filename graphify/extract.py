@@ -3993,7 +3993,7 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                     })
 
     # Hard exclusion: remove framework noise nodes entirely (node + all edges)
-    _EXCLUDED_LABELS = frozenset({"LoggerService"})
+    _EXCLUDED_LABELS = frozenset({"LoggerService", "PrismaPostgresService", "RedisLockService"})
     excluded_nids = {n["id"] for n in all_nodes if n.get("label") in _EXCLUDED_LABELS}
     if excluded_nids:
         all_nodes = [n for n in all_nodes if n["id"] not in excluded_nids]
