@@ -642,11 +642,9 @@ def _extract_decorator_args(decorator_node, source: bytes) -> tuple[str | None, 
                                         for item in value_node.children:
                                             if item.type == "identifier":
                                                 values.append(_read_text(item, source))
-                                            elif item.type == "call_expression":
-                                                # e.g., forwardRef(() => SomeService)
-                                                fn = item.child_by_field_name("function")
-                                                if fn:
-                                                    values.append(_read_text(fn, source))
+                                            # Skip call_expression items (ConfigModule.forFeature(),
+                                            # ElasticsearchModule.registerAsync(), etc.) — these are
+                                            # framework boilerplate with no business logic value
                                     elif value_node.type == "identifier":
                                         values.append(_read_text(value_node, source))
                                     if values:
@@ -701,6 +699,7 @@ def _extract_constructor_di(method_node, source: bytes, class_nid: str,
                 if type_name[0].isupper() and type_name not in (
                     "String", "Number", "Boolean", "Date", "Promise", "Observable",
                     "Array", "Map", "Set", "Record", "Partial", "Required",
+                    "LoggerService",
                 ):
                     tgt_nid = _make_id(stem, type_name)
                     edges.append({
@@ -723,6 +722,7 @@ def _extract_constructor_di(method_node, source: bytes, class_nid: str,
                     type_name = _read_text(id_node, source)
                     if type_name[0].isupper() and type_name not in (
                         "String", "Number", "Boolean", "Promise", "Observable",
+                        "LoggerService",
                     ):
                         tgt_nid = _make_id(stem, type_name)
                         edges.append({
@@ -742,11 +742,11 @@ def _extract_constructor_di(method_node, source: bytes, class_nid: str,
 
 
 # NestJS decorator → edge relation mapping
+# Only providers and controllers are kept — imports/exports are module wiring
+# with no business logic value (user directive: skip module linking)
 _NESTJS_MODULE_RELATIONS = {
-    "imports": "imports_module",
     "providers": "provides",
     "controllers": "exposes_controller",
-    "exports": "exports_service",
 }
 
 
@@ -1166,7 +1166,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     # but do NOT add it as a node to the graph.
     seen_ids.add(file_nid)
 
-    def walk(node, parent_class_nid: str | None = None) -> None:
+    def walk(node, parent_class_nid: str | None = None, parent_class_label: str | None = None) -> None:
         t = node.type
 
         # Import types
@@ -1262,7 +1262,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             body = _find_body(node, config)
             if body:
                 for child in body.children:
-                    walk(child, parent_class_nid=class_nid)
+                    walk(child, parent_class_nid=class_nid, parent_class_label=class_name)
             return
 
         # Event listener property arrays: $listen = [Event::class => [Listener::class]]
@@ -1344,7 +1344,8 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             line = node.start_point[0] + 1
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                method_label = f"{parent_class_label}.{func_name}()" if parent_class_label else f".{func_name}()"
+                add_node(func_nid, method_label, line)
                 add_edge(parent_class_nid, func_nid, "method", line)
                 # TS/JS constructor: extract DI injection edges from typed params
                 if func_name == "constructor" and config.ts_module in (
@@ -1395,6 +1396,11 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
         label_to_nid[normalised.lower()] = n["id"]
+        # For class-qualified method labels "ClassName.method", also register just "method"
+        if "." in normalised:
+            method_part = normalised.rsplit(".", 1)[1]
+            if method_part:
+                label_to_nid.setdefault(method_part.lower(), n["id"])
 
     seen_call_pairs: set[tuple[str, str]] = set()
     seen_static_ref_pairs: set[tuple[str, str, str]] = set()
@@ -1716,8 +1722,8 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     # ── Clean edges ───────────────────────────────────────────────────────────
     # Allow edges whose targets may exist in other files (imports, DI, module wiring)
     _CROSS_FILE_RELATIONS = frozenset({
-        "imports", "imports_from", "imports_module", "provides",
-        "exposes_controller", "exports_service", "injects",
+        "imports", "imports_from", "provides",
+        "exposes_controller", "injects",
     })
     valid_ids = seen_ids
     clean_edges = []
@@ -3297,8 +3303,8 @@ def _resolve_cross_file_imports_ts(
                             "source": src_nid,
                             "target": nid,
                             "relation": "injects",
-                            "confidence": "INFERRED",
-                            "confidence_score": 0.9,
+                            "confidence": "EXTRACTED",
+                            "confidence_score": 1.0,
                             "source_file": str_path,
                             "source_location": edge.get("source_location", ""),
                             "weight": 1.0,
@@ -3308,7 +3314,7 @@ def _resolve_cross_file_imports_ts(
         # Resolve @Module wiring edges (provides, exports_service, exposes_controller)
         # These are created with tgt_nid = _make_id(module_stem, ClassName) but the
         # actual target lives in its own file with tgt_nid = _make_id(service_stem, ClassName)
-        _MODULE_WIRING_RELATIONS = ("provides", "exports_service", "exposes_controller")
+        _MODULE_WIRING_RELATIONS = ("provides", "exposes_controller")
         file_stem = Path(str_path).stem
         for edge in file_result.get("edges", []):
             if edge.get("relation") not in _MODULE_WIRING_RELATIONS:
@@ -3888,11 +3894,15 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
     # nodes from all files, resolve any callee that exists in another file.
+    # NOTE: For TS/JS, DI-aware resolution (below) handles this.field.method() calls.
+    # This generic pass is limited to class/function-level calls only to prevent fan-out.
     global_label_to_nid: dict[str, str] = {}
+    # Only register class-level and top-level function nodes (not method nodes)
+    # Method nodes have "." in their label (e.g., "ClassName.method()")
     for n in all_nodes:
         raw = n.get("label", "")
         normalised = raw.strip("()").lstrip(".")
-        if normalised:
+        if normalised and "." not in normalised:
             global_label_to_nid[normalised.lower()] = n["id"]
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
@@ -3931,14 +3941,15 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         for n in all_nodes:
             label = n.get("label", "")
             nid = n["id"]
-            if label.startswith(".") and label.endswith("()"):
-                # Method node: label = ".method_name()", parent is the class nid prefix
-                method_name = label.strip(".").rstrip("()")
+            # Method labels are now "ClassName.method_name()" or legacy ".method_name()"
+            if label.endswith("()") and "." in label:
+                # Extract method_name from either "ClassName.method()" or ".method()"
+                method_name = label.rsplit(".", 1)[1].rstrip("()")
                 # Find parent class by checking if nid starts with a known class nid
                 for cn in all_nodes:
                     cn_label = cn.get("label", "")
                     cn_nid = cn["id"]
-                    if (not cn_label.startswith(".") and not cn_label.endswith("()")
+                    if ("." not in cn_label and not cn_label.endswith("()")
                             and nid.startswith(cn_nid + "_")):
                         class_methods.setdefault(cn_label, {})[method_name] = nid
                         break
