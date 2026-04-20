@@ -91,15 +91,76 @@ def _load_tsconfig(file_path: str) -> dict | None:
         except (OSError, json.JSONDecodeError):
             pass
 
-    result = {"base_url": base_url, "paths": paths, "root": tsconfig_path.parent}
+    result = {"base_url": base_url, "paths": paths, "root": tsconfig_path.parent.resolve()}
     _tsconfig_cache[dir_path] = result
     return result
+
+
+_node_modules_cache: dict[str, set[str]] = {}
+
+
+def _get_node_modules_packages(file_path: str) -> set[str]:
+    """Get top-level package names from the nearest node_modules directory.
+
+    Caches per project root (tsconfig location or first node_modules parent).
+    Handles both bare packages (lodash) and scoped packages (@nestjs/common).
+    """
+    tsconfig = _load_tsconfig(file_path)
+    if tsconfig:
+        root = str(tsconfig["root"])
+    else:
+        root = str(Path(file_path).parent)
+
+    if root in _node_modules_cache:
+        return _node_modules_cache[root]
+
+    nm_path = Path(root) / "node_modules"
+    packages: set[str] = set()
+    if nm_path.is_dir():
+        for entry in nm_path.iterdir():
+            name = entry.name
+            if name.startswith("."):
+                continue
+            if name.startswith("@") and entry.is_dir():
+                # Scoped packages: @scope/pkg
+                for sub in entry.iterdir():
+                    if not sub.name.startswith("."):
+                        packages.add(f"{name}/{sub.name}")
+            else:
+                packages.add(name)
+
+    _node_modules_cache[root] = packages
+    return packages
+
+
+def _is_npm_import(raw_import: str, file_path: str) -> bool:
+    """Check if a non-relative import is an npm/node_modules package.
+
+    Identifies the package name from the import specifier:
+    - 'lodash' or 'lodash/merge' → package = 'lodash'
+    - '@nestjs/common' or '@nestjs/common/decorators' → package = '@nestjs/common'
+    - 'src/modules/foo' → package = 'src' (won't be in node_modules)
+    """
+    if raw_import.startswith("@"):
+        # Scoped: @scope/pkg or @scope/pkg/subpath
+        parts = raw_import.split("/")
+        if len(parts) >= 2:
+            pkg_name = f"{parts[0]}/{parts[1]}"
+        else:
+            pkg_name = raw_import
+    else:
+        # Bare: pkg or pkg/subpath
+        pkg_name = raw_import.split("/")[0]
+
+    packages = _get_node_modules_packages(file_path)
+    return pkg_name in packages
 
 
 def _resolve_ts_import_path(raw_import: str, file_path: str) -> str | None:
     """Resolve a non-relative TS/JS import to a file path using tsconfig paths.
 
-    Returns the resolved relative path (from project root) or None if not resolvable.
+    Returns the resolved path relative to project root, or None if not resolvable.
+    The returned path matches the format used for file node IDs.
     """
     tsconfig = _load_tsconfig(file_path)
     if tsconfig is None:
@@ -110,14 +171,20 @@ def _resolve_ts_import_path(raw_import: str, file_path: str) -> str | None:
     root: Path = tsconfig["root"]
 
     def _try_resolve(resolved: Path) -> str | None:
-        """Try common TS/JS extensions and index files, return absolute path or None."""
+        """Try common TS/JS extensions and index files, return path relative to root."""
         for ext in (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"):
             candidate = Path(str(resolved) + ext)
             if candidate.exists() and candidate.is_file():
-                return str(candidate.resolve())
+                try:
+                    return str(candidate.relative_to(root))
+                except ValueError:
+                    return str(candidate)
         # Exact match (already has extension)
         if resolved.exists() and resolved.is_file():
-            return str(resolved.resolve())
+            try:
+                return str(resolved.relative_to(root))
+            except ValueError:
+                return str(resolved)
         return None
 
     # 1. Try path alias matching (e.g., @api/* → lib/api/src/*)
@@ -284,9 +351,12 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
             raw = _read_text(child, source).strip("'\"` ")
             if not raw:
                 break
+
+            tgt_nid: str | None = None
+
             if raw.startswith("."):
-                # Relative import - resolve to full path so IDs match file node IDs
-                # normpath removes ".." segments so the ID matches the target file's own node ID
+                # ── RELATIVE IMPORT ──
+                # Resolve from current file's directory. normpath collapses ".." segments.
                 resolved = Path(os.path.normpath(Path(str_path).parent / raw))
                 # TypeScript ESM: imports written as .js but actual file is .ts/.tsx
                 if resolved.suffix == ".js":
@@ -308,17 +378,21 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                                 resolved = candidate
                                 break
                 tgt_nid = _make_id(str(resolved))
+
             else:
-                # Try tsconfig path alias / baseUrl resolution first
+                # ── NON-RELATIVE IMPORT ──
+                # Step 1: Is this an npm/node_modules package? → SKIP
+                if _is_npm_import(raw, str_path):
+                    break
+
+                # Step 2: Project import — resolve via tsconfig paths/baseUrl
                 resolved_path = _resolve_ts_import_path(raw, str_path)
                 if resolved_path:
                     tgt_nid = _make_id(resolved_path)
                 else:
-                    # Bare/scoped import (node_modules) - use last segment; dropped as external
-                    module_name = raw.split("/")[-1]
-                    if not module_name:
-                        break
-                    tgt_nid = _make_id(module_name)
+                    # Unresolvable project import (stale/broken path) — skip
+                    break
+
             edges.append({
                 "source": file_nid,
                 "target": tgt_nid,
@@ -3072,6 +3146,9 @@ def _resolve_cross_file_imports_ts(
     # Without this, the uses-resolution pass populates existing_pairs first and
     # then silently blocks the more specific injects edges for the same pair.
     existing_injects_pairs: set[tuple[str, str]] = set()
+    # Module wiring edges (provides, exports_service, exposes_controller) also
+    # need a separate dedup set — same reason as injects above.
+    existing_wiring_pairs: set[tuple[str, str]] = set()
 
     for file_result, path in zip(per_file, paths):
         str_path = str(path)
@@ -3155,8 +3232,8 @@ def _resolve_cross_file_imports_ts(
             for name, nid in global_name_to_nid.items():
                 if _make_id(Path(str_path).stem, name) == tgt_nid and nid != tgt_nid:
                     pair = (src_nid, nid)
-                    if pair not in existing_pairs:
-                        existing_pairs.add(pair)
+                    if pair not in existing_wiring_pairs:
+                        existing_wiring_pairs.add(pair)
                         new_edges.append({
                             "source": src_nid,
                             "target": nid,
