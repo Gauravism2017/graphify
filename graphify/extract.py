@@ -3992,6 +3992,13 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                         "weight": 1.0,
                     })
 
+    # Hard exclusion: remove framework noise nodes entirely (node + all edges)
+    _EXCLUDED_LABELS = frozenset({"LoggerService"})
+    excluded_nids = {n["id"] for n in all_nodes if n.get("label") in _EXCLUDED_LABELS}
+    if excluded_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in excluded_nids]
+        all_edges = [e for e in all_edges if e["source"] not in excluded_nids and e["target"] not in excluded_nids]
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
