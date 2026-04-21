@@ -3999,6 +3999,37 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         all_nodes = [n for n in all_nodes if n["id"] not in excluded_nids]
         all_edges = [e for e in all_edges if e["source"] not in excluded_nids and e["target"] not in excluded_nids]
 
+    # Drop constructor nodes entirely — they add no navigational value.
+    # DI information is already captured via injects edges on the class node.
+    constructor_nids: set[str] = set()
+    for n in all_nodes:
+        label = n.get("label", "")
+        if label.endswith(".constructor()"):
+            constructor_nids.add(n["id"])
+    if constructor_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in constructor_nids]
+        all_edges = [e for e in all_edges if e["source"] not in constructor_nids and e["target"] not in constructor_nids]
+
+    # Prune leaf method nodes: methods whose only edge is the "method" link to
+    # their parent class add no cross-class navigational value and create a
+    # gray blob of isolated nodes in graph visualisations.
+    edge_index: dict[str, list[dict]] = {}
+    for e in all_edges:
+        edge_index.setdefault(e["source"], []).append(e)
+        edge_index.setdefault(e["target"], []).append(e)
+    leaf_method_nids: set[str] = set()
+    for n in all_nodes:
+        nid = n["id"]
+        label = n.get("label", "")
+        if "." not in label or not label.endswith("()"):
+            continue
+        edges_for_node = edge_index.get(nid, [])
+        if len(edges_for_node) <= 1 and all(e.get("relation") == "method" for e in edges_for_node):
+            leaf_method_nids.add(nid)
+    if leaf_method_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in leaf_method_nids]
+        all_edges = [e for e in all_edges if e["source"] not in leaf_method_nids and e["target"] not in leaf_method_nids]
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
