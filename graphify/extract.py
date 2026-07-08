@@ -11,6 +11,212 @@ from typing import Callable, Any
 from .cache import load_cached, save_cached
 
 
+# ── tsconfig.json / Nx workspace path resolver ────────────────────────────────
+
+_tsconfig_cache: dict[str, dict | None] = {}
+
+
+def _load_tsconfig(file_path: str) -> dict | None:
+    """Find and parse the nearest tsconfig.json, caching per directory.
+
+    Walks up from the file's directory looking for tsconfig.json.
+    If an Nx workspace is detected (nx.json exists at the tsconfig root),
+    merges tsconfig.base.json paths as fallbacks.
+
+    Returns dict with keys: base_url (absolute Path), paths (dict of alias→[targets]).
+    """
+    dir_path = str(Path(file_path).parent)
+    if dir_path in _tsconfig_cache:
+        return _tsconfig_cache[dir_path]
+
+    # Walk up to find tsconfig.json
+    current = Path(file_path).parent
+    tsconfig_path = None
+    for _ in range(50):  # safety limit
+        candidate = current / "tsconfig.json"
+        if candidate.exists():
+            tsconfig_path = candidate
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    if tsconfig_path is None:
+        _tsconfig_cache[dir_path] = None
+        return None
+
+    try:
+        raw = tsconfig_path.read_text(encoding="utf-8")
+        # Strip single-line comments (tsconfig allows them)
+        raw = re.sub(r"//[^\n]*", "", raw)
+        # Strip trailing commas before } or ]
+        raw = re.sub(r",\s*([}\]])", r"\1", raw)
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        _tsconfig_cache[dir_path] = None
+        return None
+
+    compiler_opts = data.get("compilerOptions", {})
+    base_url_raw = compiler_opts.get("baseUrl", ".")
+    base_url = (tsconfig_path.parent / base_url_raw).resolve()
+    paths = dict(compiler_opts.get("paths", {}))
+
+    # Nx workspace: check for tsconfig.base.json at the same level
+    tsconfig_base = tsconfig_path.parent / "tsconfig.base.json"
+    if not tsconfig_base.exists():
+        # Also check if nx.json is present at parent (monorepo root)
+        nx_root = tsconfig_path.parent
+        while nx_root != nx_root.parent:
+            if (nx_root / "nx.json").exists():
+                tsconfig_base = nx_root / "tsconfig.base.json"
+                break
+            nx_root = nx_root.parent
+
+    if tsconfig_base.exists() and tsconfig_base != tsconfig_path:
+        try:
+            base_raw = tsconfig_base.read_text(encoding="utf-8")
+            base_raw = re.sub(r"//[^\n]*", "", base_raw)
+            base_raw = re.sub(r",\s*([}\]])", r"\1", base_raw)
+            base_data = json.loads(base_raw)
+            base_compiler = base_data.get("compilerOptions", {})
+            # Workspace base_url (if not overridden by project)
+            if "baseUrl" not in compiler_opts and "baseUrl" in base_compiler:
+                base_url = (tsconfig_base.parent / base_compiler["baseUrl"]).resolve()
+            # Merge paths: project paths override workspace paths
+            base_paths = base_compiler.get("paths", {})
+            for alias, targets in base_paths.items():
+                if alias not in paths:
+                    paths[alias] = targets
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result = {"base_url": base_url, "paths": paths, "root": tsconfig_path.parent.resolve()}
+    _tsconfig_cache[dir_path] = result
+    return result
+
+
+_node_modules_cache: dict[str, set[str]] = {}
+
+
+def _get_node_modules_packages(file_path: str) -> set[str]:
+    """Get top-level package names from the nearest node_modules directory.
+
+    Caches per project root (tsconfig location or first node_modules parent).
+    Handles both bare packages (lodash) and scoped packages (@nestjs/common).
+    """
+    tsconfig = _load_tsconfig(file_path)
+    if tsconfig:
+        root = str(tsconfig["root"])
+    else:
+        root = str(Path(file_path).parent)
+
+    if root in _node_modules_cache:
+        return _node_modules_cache[root]
+
+    nm_path = Path(root) / "node_modules"
+    packages: set[str] = set()
+    if nm_path.is_dir():
+        for entry in nm_path.iterdir():
+            name = entry.name
+            if name.startswith("."):
+                continue
+            if name.startswith("@") and entry.is_dir():
+                # Scoped packages: @scope/pkg
+                for sub in entry.iterdir():
+                    if not sub.name.startswith("."):
+                        packages.add(f"{name}/{sub.name}")
+            else:
+                packages.add(name)
+
+    _node_modules_cache[root] = packages
+    return packages
+
+
+def _is_npm_import(raw_import: str, file_path: str) -> bool:
+    """Check if a non-relative import is an npm/node_modules package.
+
+    Identifies the package name from the import specifier:
+    - 'lodash' or 'lodash/merge' → package = 'lodash'
+    - '@nestjs/common' or '@nestjs/common/decorators' → package = '@nestjs/common'
+    - 'src/modules/foo' → package = 'src' (won't be in node_modules)
+    """
+    if raw_import.startswith("@"):
+        # Scoped: @scope/pkg or @scope/pkg/subpath
+        parts = raw_import.split("/")
+        if len(parts) >= 2:
+            pkg_name = f"{parts[0]}/{parts[1]}"
+        else:
+            pkg_name = raw_import
+    else:
+        # Bare: pkg or pkg/subpath
+        pkg_name = raw_import.split("/")[0]
+
+    packages = _get_node_modules_packages(file_path)
+    return pkg_name in packages
+
+
+def _resolve_ts_import_path(raw_import: str, file_path: str) -> str | None:
+    """Resolve a non-relative TS/JS import to a file path using tsconfig paths.
+
+    Returns the resolved path relative to project root, or None if not resolvable.
+    The returned path matches the format used for file node IDs.
+    """
+    tsconfig = _load_tsconfig(file_path)
+    if tsconfig is None:
+        return None
+
+    base_url: Path = tsconfig["base_url"]
+    paths: dict = tsconfig["paths"]
+    root: Path = tsconfig["root"]
+
+    def _try_resolve(resolved: Path) -> str | None:
+        """Try common TS/JS extensions and index files, return path relative to root."""
+        for ext in (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"):
+            candidate = Path(str(resolved) + ext)
+            if candidate.exists() and candidate.is_file():
+                try:
+                    return str(candidate.relative_to(root))
+                except ValueError:
+                    return str(candidate)
+        # Exact match (already has extension)
+        if resolved.exists() and resolved.is_file():
+            try:
+                return str(resolved.relative_to(root))
+            except ValueError:
+                return str(resolved)
+        return None
+
+    # 1. Try path alias matching (e.g., @api/* → lib/api/src/*)
+    for alias, targets in paths.items():
+        if alias.endswith("/*"):
+            prefix = alias[:-2]
+            if raw_import.startswith(prefix + "/"):
+                remainder = raw_import[len(prefix) + 1:]
+                for target in targets:
+                    if target.endswith("/*"):
+                        resolved = base_url / target[:-2] / remainder
+                    else:
+                        resolved = base_url / target / remainder
+                    result = _try_resolve(resolved)
+                    if result:
+                        return result
+                return None
+        else:
+            # Exact match (e.g., "@app" → ["src/app"])
+            if raw_import == alias:
+                for target in targets:
+                    resolved = base_url / target
+                    result = _try_resolve(resolved)
+                    if result:
+                        return result
+                return None
+
+    # 2. Try baseUrl resolution (e.g., src/modules/... with baseUrl=".")
+    resolved = base_url / raw_import
+    return _try_resolve(resolved)
+
+
 def _make_id(*parts: str) -> str:
     """Build a stable node ID from one or more name parts."""
     combined = "_".join(p.strip("_.") for p in parts if p)
@@ -139,28 +345,76 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
             })
 
 
+def _extract_import_specifiers(node, source: bytes) -> list[str]:
+    """Extract named import specifiers from an import_statement AST node.
+
+    Returns the list of imported names (original names, not aliases).
+    For `import { A, B as C } from '...'` returns ['A', 'B'].
+    For `import Default from '...'` returns ['Default'].
+    For `import * as X from '...'` returns [] (namespace — cannot determine used symbols).
+    """
+    specifiers: list[str] = []
+    for child in node.children:
+        if child.type == "import_clause":
+            for clause_child in child.children:
+                if clause_child.type == "named_imports":
+                    for spec in clause_child.children:
+                        if spec.type == "import_specifier":
+                            name_node = spec.child_by_field_name("name")
+                            if name_node:
+                                specifiers.append(_read_text(name_node, source))
+                            elif spec.children:
+                                specifiers.append(_read_text(spec.children[0], source))
+                elif clause_child.type == "identifier":
+                    specifiers.append(_read_text(clause_child, source))
+                elif clause_child.type == "namespace_import":
+                    pass
+    return specifiers
+
+
 def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
     for child in node.children:
         if child.type == "string":
             raw = _read_text(child, source).strip("'\"` ")
             if not raw:
                 break
+
+            tgt_nid: str | None = None
+
             if raw.startswith("."):
-                # Relative import - resolve to full path so IDs match file node IDs
-                # normpath removes ".." segments so the ID matches the target file's own node ID
+                # ── RELATIVE IMPORT ──
                 resolved = Path(os.path.normpath(Path(str_path).parent / raw))
-                # TypeScript ESM: imports written as .js but actual file is .ts/.tsx
                 if resolved.suffix == ".js":
                     resolved = resolved.with_suffix(".ts")
                 elif resolved.suffix == ".jsx":
                     resolved = resolved.with_suffix(".tsx")
+                if not (resolved.exists() and resolved.is_file()):
+                    for ext in (".ts", ".tsx", ".js", ".jsx"):
+                        candidate = Path(str(resolved) + ext)
+                        if candidate.exists() and candidate.is_file():
+                            resolved = candidate
+                            break
+                    else:
+                        for idx in ("index.ts", "index.tsx", "index.js"):
+                            candidate = resolved / idx
+                            if candidate.exists() and candidate.is_file():
+                                resolved = candidate
+                                break
                 tgt_nid = _make_id(str(resolved))
+
             else:
-                # Bare/scoped import (node_modules) - use last segment; dropped as external
-                module_name = raw.split("/")[-1]
-                if not module_name:
+                # ── NON-RELATIVE IMPORT ──
+                if _is_npm_import(raw, str_path):
                     break
-                tgt_nid = _make_id(module_name)
+
+                resolved_path = _resolve_ts_import_path(raw, str_path)
+                if resolved_path:
+                    tgt_nid = _make_id(resolved_path)
+                else:
+                    break
+
+            specifiers = _extract_import_specifiers(node, source)
+
             edges.append({
                 "source": file_nid,
                 "target": tgt_nid,
@@ -169,6 +423,7 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
+                "specifiers": specifiers,
             })
             break
 
@@ -353,12 +608,152 @@ def _get_cpp_func_name(node, source: bytes) -> str | None:
     return None
 
 
-# ── JS/TS extra walk for arrow functions ──────────────────────────────────────
+# ── JS/TS extra walk for arrow functions + NestJS decorators ─────────────────
+
+def _extract_decorator_args(decorator_node, source: bytes) -> tuple[str | None, dict[str, list[str]]]:
+    """Extract decorator name and its object argument keys/values from a decorator AST node.
+
+    Returns (decorator_name, {key: [value_identifiers]}).
+    E.g., @Module({imports: [AuthModule], providers: [AuthService]})
+    → ("Module", {"imports": ["AuthModule"], "providers": ["AuthService"]})
+    """
+    name = None
+    args_dict: dict[str, list[str]] = {}
+
+    for child in decorator_node.children:
+        if child.type == "call_expression":
+            # Get decorator name
+            func_node = child.child_by_field_name("function")
+            if func_node:
+                name = _read_text(func_node, source)
+            # Get arguments
+            args_node = child.child_by_field_name("arguments")
+            if args_node:
+                for arg in args_node.children:
+                    if arg.type == "object":
+                        for pair in arg.children:
+                            if pair.type == "pair":
+                                key_node = pair.child_by_field_name("key")
+                                value_node = pair.child_by_field_name("value")
+                                if key_node and value_node:
+                                    key = _read_text(key_node, source)
+                                    values: list[str] = []
+                                    if value_node.type == "array":
+                                        for item in value_node.children:
+                                            if item.type == "identifier":
+                                                values.append(_read_text(item, source))
+                                            # Skip call_expression items (ConfigModule.forFeature(),
+                                            # ElasticsearchModule.registerAsync(), etc.) — these are
+                                            # framework boilerplate with no business logic value
+                                    elif value_node.type == "identifier":
+                                        values.append(_read_text(value_node, source))
+                                    if values:
+                                        args_dict[key] = values
+        elif child.type == "identifier":
+            # Simple decorator without call: @Injectable
+            name = _read_text(child, source)
+
+    return name, args_dict
+
+
+def _extract_constructor_di(method_node, source: bytes, class_nid: str,
+                            stem: str, edges: list, str_path: str) -> dict[str, str]:
+    """Extract DI injection edges from constructor parameters.
+
+    Looks for typed constructor params like:
+        constructor(private readonly auth_service: AuthService)
+    Creates: ClassNid --injects--> _make_id(stem, "AuthService")
+    Returns: {field_name: TypeName} map for DI-aware method call resolution.
+    """
+    di_map: dict[str, str] = {}
+    params_node = method_node.child_by_field_name("parameters")
+    if params_node is None:
+        return di_map
+
+    line = method_node.start_point[0] + 1
+    for param in params_node.children:
+        if param.type not in ("required_parameter", "formal_parameter"):
+            continue
+
+        # Extract field name (the parameter identifier)
+        field_name: str | None = None
+        for child in param.children:
+            if child.type == "identifier":
+                field_name = _read_text(child, source)
+                break
+            elif child.type in ("accessibility_modifier", "readonly"):
+                continue
+
+        # Find type_annotation → type_identifier
+        type_ann = None
+        for child in param.children:
+            if child.type == "type_annotation":
+                type_ann = child
+                break
+        if type_ann is None:
+            continue
+        # Extract the type identifier
+        for child in type_ann.children:
+            if child.type == "type_identifier":
+                type_name = _read_text(child, source)
+                if type_name[0].isupper() and type_name not in (
+                    "String", "Number", "Boolean", "Date", "Promise", "Observable",
+                    "Array", "Map", "Set", "Record", "Partial", "Required",
+                    "LoggerService",
+                ):
+                    tgt_nid = _make_id(stem, type_name)
+                    edges.append({
+                        "source": class_nid,
+                        "target": tgt_nid,
+                        "relation": "injects",
+                        "confidence": "EXTRACTED",
+                        "source_file": str_path,
+                        "source_location": f"L{line}",
+                        "weight": 1.0,
+                    })
+                    if field_name:
+                        di_map[field_name] = type_name
+                break
+            elif child.type == "generic_type":
+                id_node = child.child_by_field_name("name") or (
+                    child.children[0] if child.children else None
+                )
+                if id_node and id_node.type == "type_identifier":
+                    type_name = _read_text(id_node, source)
+                    if type_name[0].isupper() and type_name not in (
+                        "String", "Number", "Boolean", "Promise", "Observable",
+                        "LoggerService",
+                    ):
+                        tgt_nid = _make_id(stem, type_name)
+                        edges.append({
+                            "source": class_nid,
+                            "target": tgt_nid,
+                            "relation": "injects",
+                            "confidence": "EXTRACTED",
+                            "source_file": str_path,
+                            "source_location": f"L{line}",
+                            "weight": 1.0,
+                        })
+                        if field_name:
+                            di_map[field_name] = type_name
+                break
+
+    return di_map
+
+
+# NestJS decorator → edge relation mapping
+# Only providers and controllers are kept — imports/exports are module wiring
+# with no business logic value (user directive: skip module linking)
+_NESTJS_MODULE_RELATIONS = {
+    "providers": "provides",
+    "controllers": "exposes_controller",
+}
+
 
 def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                    nodes: list, edges: list, seen_ids: set, function_bodies: list,
                    parent_class_nid: str | None, add_node_fn, add_edge_fn) -> bool:
-    """Handle lexical_declaration (arrow functions) for JS/TS. Returns True if handled."""
+    """Handle lexical_declaration (arrow functions) and NestJS decorators for JS/TS."""
     if node.type == "lexical_declaration":
         for child in node.children:
             if child.type == "variable_declarator":
@@ -370,11 +765,59 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                         line = child.start_point[0] + 1
                         func_nid = _make_id(stem, func_name)
                         add_node_fn(func_nid, f"{func_name}()", line)
-                        add_edge_fn(file_nid, func_nid, "contains", line)
                         body = value.child_by_field_name("body")
                         if body:
                             function_bodies.append((func_nid, body))
         return True
+
+    # NestJS/Angular decorated class (export_statement with decorator children)
+    if node.type == "export_statement":
+        decorators = [c for c in node.children if c.type == "decorator"]
+        if not decorators:
+            return False
+
+        # Find the class declaration inside this export
+        class_node = None
+        for child in node.children:
+            if child.type == "class_declaration":
+                class_node = child
+                break
+        if class_node is None:
+            return False
+
+        # Process each decorator on this class
+        name_node = class_node.child_by_field_name("name")
+        if not name_node:
+            return False
+        class_name = _read_text(name_node, source)
+        class_nid = _make_id(stem, class_name)
+        line = class_node.start_point[0] + 1
+
+        for dec in decorators:
+            dec_name, dec_args = _extract_decorator_args(dec, source)
+            if dec_name == "Module":
+                # @Module({imports, providers, controllers, exports})
+                for key, relation in _NESTJS_MODULE_RELATIONS.items():
+                    for value_name in dec_args.get(key, []):
+                        tgt_nid = _make_id(stem, value_name)
+                        edges.append({
+                            "source": class_nid,
+                            "target": tgt_nid,
+                            "relation": relation,
+                            "confidence": "EXTRACTED",
+                            "source_file": str_path,
+                            "source_location": f"L{dec.start_point[0] + 1}",
+                            "weight": 1.0,
+                        })
+            elif dec_name in ("Injectable", "Controller", "Resolver", "Gateway"):
+                # Store as node attribute instead of creating virtual framework nodes.
+                # The class node may not exist yet (added later by walk()),
+                # so use seen_ids dict as a pending annotation store.
+                seen_ids.add(f"__nestjs_type__{class_nid}__{dec_name.lower()}")
+
+        # Don't return True — let the main walk handle the class body normally
+        return False
+
     return False
 
 
@@ -450,7 +893,7 @@ _JS_CONFIG = LanguageConfig(
 _TS_CONFIG = LanguageConfig(
     ts_module="tree_sitter_typescript",
     ts_language_fn="language_typescript",
-    class_types=frozenset({"class_declaration"}),
+    class_types=frozenset({"class_declaration", "interface_declaration"}),
     function_types=frozenset({"function_declaration", "method_definition"}),
     import_types=frozenset({"import_statement"}),
     call_types=frozenset({"call_expression"}),
@@ -683,17 +1126,28 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
     pending_listen_edges: list[tuple[str, str, int]] = []
+    # DI maps: class_nid → {field_name: TypeName} for DI-aware call resolution
+    di_maps: dict[str, dict[str, str]] = {}
+    # Raw calls with receiver info for DI-aware resolution
+    raw_di_calls: list[dict] = []
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({
+            node_data: dict = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
                 "source_location": f"L{line}",
-            })
+            }
+            # Check for pending NestJS type annotations
+            for dec_type in ("injectable", "controller", "resolver", "gateway"):
+                marker = f"__nestjs_type__{nid}__{dec_type}"
+                if marker in seen_ids:
+                    node_data["nestjs_type"] = dec_type
+                    break
+            nodes.append(node_data)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
@@ -708,9 +1162,11 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         })
 
     file_nid = _make_id(str(path))
-    add_node(file_nid, path.name, 1)
+    # Register file_nid in seen_ids so import edges (source=file_nid) pass edge cleanup,
+    # but do NOT add it as a node to the graph.
+    seen_ids.add(file_nid)
 
-    def walk(node, parent_class_nid: str | None = None) -> None:
+    def walk(node, parent_class_nid: str | None = None, parent_class_label: str | None = None) -> None:
         t = node.type
 
         # Import types
@@ -734,7 +1190,6 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             class_nid = _make_id(stem, class_name)
             line = node.start_point[0] + 1
             add_node(class_nid, class_name, line)
-            add_edge(file_nid, class_nid, "contains", line)
 
             # Python-specific: inheritance
             if config.ts_module == "tree_sitter_python":
@@ -807,7 +1262,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             body = _find_body(node, config)
             if body:
                 for child in body.children:
-                    walk(child, parent_class_nid=class_nid)
+                    walk(child, parent_class_nid=class_nid, parent_class_label=class_name)
             return
 
         # Event listener property arrays: $listen = [Event::class => [Listener::class]]
@@ -889,12 +1344,21 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             line = node.start_point[0] + 1
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                method_label = f"{parent_class_label}.{func_name}()" if parent_class_label else f".{func_name}()"
+                add_node(func_nid, method_label, line)
                 add_edge(parent_class_nid, func_nid, "method", line)
+                # TS/JS constructor: extract DI injection edges from typed params
+                if func_name == "constructor" and config.ts_module in (
+                    "tree_sitter_typescript", "tree_sitter_javascript"
+                ):
+                    class_di = _extract_constructor_di(
+                        node, source, parent_class_nid, stem, edges, str_path
+                    )
+                    if class_di:
+                        di_maps[parent_class_nid] = class_di
             else:
                 func_nid = _make_id(stem, func_name)
                 add_node(func_nid, f"{func_name}()", line)
-                add_edge(file_nid, func_nid, "contains", line)
 
             body = _find_body(node, config)
             if body:
@@ -932,6 +1396,11 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
         label_to_nid[normalised.lower()] = n["id"]
+        # For class-qualified method labels "ClassName.method", also register just "method"
+        if "." in normalised:
+            method_part = normalised.rsplit(".", 1)[1]
+            if method_part:
+                label_to_nid.setdefault(method_part.lower(), n["id"])
 
     seen_call_pairs: set[tuple[str, str]] = set()
     seen_static_ref_pairs: set[tuple[str, str, str]] = set()
@@ -1046,6 +1515,29 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             attr = func_node.child_by_field_name(config.call_accessor_field)
                             if attr:
                                 callee_name = _read_text(attr, source)
+                        # TS/JS DI-aware: extract receiver for this.field.method() pattern
+                        if config.ts_module in ("tree_sitter_typescript", "tree_sitter_javascript"):
+                            obj_node = func_node.child_by_field_name("object")
+                            if obj_node and obj_node.type == "member_expression":
+                                # this.field.method() → obj_node is "this.field"
+                                this_node = obj_node.child_by_field_name("object")
+                                field_node = obj_node.child_by_field_name("property")
+                                if (this_node and _read_text(this_node, source) == "this"
+                                        and field_node):
+                                    receiver_field = _read_text(field_node, source)
+                                    if callee_name and receiver_field:
+                                        raw_di_calls.append({
+                                            "caller_nid": caller_nid,
+                                            "receiver_field": receiver_field,
+                                            "method": callee_name,
+                                            "source_file": str_path,
+                                            "source_location": f"L{node.start_point[0] + 1}",
+                                        })
+                                        # Skip generic resolution for DI calls
+                                        callee_name = None
+                            elif obj_node and _read_text(obj_node, source) == "this":
+                                # this.method() → same-class call, let normal resolution handle it
+                                pass
                     else:
                         # Try reading the node directly (e.g. Java name field is the callee)
                         callee_name = _read_text(func_node, source)
@@ -1228,14 +1720,25 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         })
 
     # ── Clean edges ───────────────────────────────────────────────────────────
+    # Allow edges whose targets may exist in other files (imports, DI, module wiring)
+    _CROSS_FILE_RELATIONS = frozenset({
+        "imports", "imports_from", "provides",
+        "exposes_controller", "injects",
+    })
     valid_ids = seen_ids
     clean_edges = []
     for edge in edges:
         src, tgt = edge["source"], edge["target"]
-        if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
+        if src in valid_ids and (tgt in valid_ids or edge["relation"] in _CROSS_FILE_RELATIONS):
             clean_edges.append(edge)
 
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    return {
+        "nodes": nodes,
+        "edges": clean_edges,
+        "raw_calls": raw_calls,
+        "di_maps": di_maps,
+        "raw_di_calls": raw_di_calls,
+    }
 
 
 # ── Python rationale extraction ───────────────────────────────────────────────
@@ -2664,6 +3167,203 @@ def _resolve_cross_file_imports(
     return new_edges
 
 
+def _resolve_cross_file_imports_ts(
+    per_file: list[dict],
+    paths: list[Path],
+) -> list[dict]:
+    """
+    Two-pass TS/JS import resolution: turn file-level imports_from into class-level edges.
+
+    Pass 1 - build global map: class/function name → node_id (from all TS/JS files)
+    Pass 2 - for each import edge, resolve the imported names against the global map
+             and add INFERRED edges from each class in the importing file to the
+             imported entity.
+
+    This leverages the tsconfig resolver to properly handle path aliases.
+    """
+    # Pass 1: build global name → nid map
+    # Class nodes have labels like "AppModule", "AuthService" (no parens, no dot prefix)
+    stem_to_entities: dict[str, dict[str, str]] = {}
+    file_nid_to_stem: dict[str, str] = {}
+
+    for file_result, path in zip(per_file, paths):
+        stem = path.stem
+        for node in file_result.get("nodes", []):
+            nid = node.get("id", "")
+            label = node.get("label", "")
+            # Index classes (no parens suffix) - skip file nodes and methods
+            if label and not label.endswith(")") and not label.startswith("."):
+                stem_to_entities.setdefault(stem, {})[label] = nid
+
+        # Map file node IDs to stems
+        file_nid = _make_id(str(path))
+        file_nid_to_stem[file_nid] = stem
+
+    # Flat name → nid (for cross-file lookup)
+    global_name_to_nid: dict[str, str] = {}
+    for stem_entities in stem_to_entities.values():
+        for name, nid in stem_entities.items():
+            global_name_to_nid[name] = nid
+
+    # Pass 2: for each file, find import edges and resolve imported names
+    new_edges: list[dict] = []
+    existing_pairs: set[tuple[str, str]] = set()
+    # DI injects edges use a separate dedup set because they are semantically
+    # distinct from "uses" edges (constructor dependency vs file-level import).
+    # Without this, the uses-resolution pass populates existing_pairs first and
+    # then silently blocks the more specific injects edges for the same pair.
+    existing_injects_pairs: set[tuple[str, str]] = set()
+    # Module wiring edges (provides, exports_service, exposes_controller) also
+    # need a separate dedup set — same reason as injects above.
+    existing_wiring_pairs: set[tuple[str, str]] = set()
+
+    for file_result, path in zip(per_file, paths):
+        str_path = str(path)
+
+        # Find classes defined in this file (importers)
+        local_classes = [
+            n["id"] for n in file_result.get("nodes", [])
+            if n.get("source_file") == str_path
+            and not n["label"].endswith(")")
+            and not n["label"].startswith(".")
+            and n["id"] != _make_id(str_path)  # exclude file node
+        ]
+        if not local_classes:
+            continue
+
+        # Find import edges from this file that resolved to real file targets
+        for edge in file_result.get("edges", []):
+            if edge.get("relation") != "imports_from":
+                continue
+            tgt_nid = edge["target"]
+            tgt_stem = file_nid_to_stem.get(tgt_nid)
+            if not tgt_stem or tgt_stem not in stem_to_entities:
+                continue
+
+            specifiers = edge.get("specifiers", [])
+            target_entities = stem_to_entities[tgt_stem]
+
+            if specifiers:
+                # Only link to the specific symbols that were imported
+                for spec_name in specifiers:
+                    entity_nid = target_entities.get(spec_name)
+                    if not entity_nid:
+                        entity_nid = global_name_to_nid.get(spec_name)
+                    if not entity_nid:
+                        continue
+                    for local_nid in local_classes:
+                        pair = (local_nid, entity_nid)
+                        if pair not in existing_pairs and local_nid != entity_nid:
+                            existing_pairs.add(pair)
+                            new_edges.append({
+                                "source": local_nid,
+                                "target": entity_nid,
+                                "relation": "uses",
+                                "confidence": "EXTRACTED",
+                                "confidence_score": 1.0,
+                                "source_file": str_path,
+                                "source_location": edge.get("source_location", ""),
+                                "weight": 1.0,
+                            })
+            else:
+                # Namespace import (import * as X) — link to all entities in target
+                for entity_name, entity_nid in target_entities.items():
+                    for local_nid in local_classes:
+                        pair = (local_nid, entity_nid)
+                        if pair not in existing_pairs and local_nid != entity_nid:
+                            existing_pairs.add(pair)
+                            new_edges.append({
+                                "source": local_nid,
+                                "target": entity_nid,
+                                "relation": "uses",
+                                "confidence": "INFERRED",
+                                "confidence_score": 0.6,
+                                "source_file": str_path,
+                                "source_location": edge.get("source_location", ""),
+                                "weight": 0.7,
+                            })
+
+        # Also resolve DI injection targets across files
+        for edge in file_result.get("edges", []):
+            if edge.get("relation") != "injects":
+                continue
+            # The target was created as _make_id(stem, TypeName) — check if it exists globally
+            src_nid = edge["source"]
+            tgt_nid = edge["target"]
+            # If the target node exists in another file, create a cross-file edge
+            # The injects edge already points to the right target if same-file
+            # For cross-file: check if a class with matching name exists elsewhere
+            for name, nid in global_name_to_nid.items():
+                if _make_id(Path(str_path).stem, name) == tgt_nid and nid != tgt_nid:
+                    # Found the real target in another file
+                    pair = (src_nid, nid)
+                    if pair not in existing_injects_pairs:
+                        existing_injects_pairs.add(pair)
+                        new_edges.append({
+                            "source": src_nid,
+                            "target": nid,
+                            "relation": "injects",
+                            "confidence": "EXTRACTED",
+                            "confidence_score": 1.0,
+                            "source_file": str_path,
+                            "source_location": edge.get("source_location", ""),
+                            "weight": 1.0,
+                        })
+                    break
+
+        # Resolve @Module wiring edges (provides, exports_service, exposes_controller)
+        # These are created with tgt_nid = _make_id(module_stem, ClassName) but the
+        # actual target lives in its own file with tgt_nid = _make_id(service_stem, ClassName)
+        _MODULE_WIRING_RELATIONS = ("provides", "exposes_controller")
+        file_stem = Path(str_path).stem
+        for edge in file_result.get("edges", []):
+            if edge.get("relation") not in _MODULE_WIRING_RELATIONS:
+                continue
+            src_nid = edge["source"]
+            tgt_nid = edge["target"]
+            # Direct lookup: try each global class name to see if it matches tgt_nid
+            # The tgt_nid was built as _make_id(file_stem, ClassName)
+            # So we match by checking: for which name does _make_id(file_stem, name) == tgt_nid
+            for name, nid in global_name_to_nid.items():
+                if _make_id(file_stem, name) == tgt_nid:
+                    real_nid = nid
+                    if real_nid != tgt_nid:
+                        pair = (src_nid, real_nid)
+                        if pair not in existing_wiring_pairs:
+                            existing_wiring_pairs.add(pair)
+                            new_edges.append({
+                                "source": src_nid,
+                                "target": real_nid,
+                                "relation": edge["relation"],
+                                "confidence": "EXTRACTED",
+                                "confidence_score": 1.0,
+                                "source_file": str_path,
+                                "source_location": edge.get("source_location", ""),
+                                "weight": 1.0,
+                            })
+                    break
+                # Also try direct name match (class name might be the trailing part)
+                if tgt_nid.endswith("_" + name.lower()) or tgt_nid == _make_id(name):
+                    real_nid = nid
+                    if real_nid != src_nid:
+                        pair = (src_nid, real_nid)
+                        if pair not in existing_wiring_pairs:
+                            existing_wiring_pairs.add(pair)
+                            new_edges.append({
+                                "source": src_nid,
+                                "target": real_nid,
+                                "relation": edge["relation"],
+                                "confidence": "EXTRACTED",
+                                "confidence_score": 1.0,
+                                "source_file": str_path,
+                                "source_location": edge.get("source_location", ""),
+                                "weight": 1.0,
+                            })
+                    break
+
+    return new_edges
+
+
 def extract_objc(path: Path) -> dict:
     """Extract interfaces, implementations, protocols, methods, and imports from .m/.mm/.h files."""
     try:
@@ -3179,14 +3879,30 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             import logging
             logging.getLogger(__name__).warning("Cross-file import resolution failed, skipping: %s", exc)
 
+    # Add cross-file class-level edges for TypeScript/JavaScript
+    ts_exts = {".ts", ".tsx", ".js", ".jsx", ".mjs"}
+    ts_paths = [p for p in paths if p.suffix in ts_exts]
+    if ts_paths:
+        ts_results = [r for r, p in zip(per_file, paths) if p.suffix in ts_exts]
+        try:
+            ts_cross_edges = _resolve_cross_file_imports_ts(ts_results, ts_paths)
+            all_edges.extend(ts_cross_edges)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("TS cross-file import resolution failed, skipping: %s", exc)
+
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
     # nodes from all files, resolve any callee that exists in another file.
+    # NOTE: For TS/JS, DI-aware resolution (below) handles this.field.method() calls.
+    # This generic pass is limited to class/function-level calls only to prevent fan-out.
     global_label_to_nid: dict[str, str] = {}
+    # Only register class-level and top-level function nodes (not method nodes)
+    # Method nodes have "." in their label (e.g., "ClassName.method()")
     for n in all_nodes:
         raw = n.get("label", "")
         normalised = raw.strip("()").lstrip(".")
-        if normalised:
+        if normalised and "." not in normalised:
             global_label_to_nid[normalised.lower()] = n["id"]
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
@@ -3209,6 +3925,110 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                     "source_location": rc.get("source_location"),
                     "weight": 1.0,
                 })
+
+    # DI-aware method call resolution for TypeScript/JavaScript
+    # Uses di_maps {class_nid → {field_name: TypeName}} and raw_di_calls
+    # to resolve this.field.method() → TargetClass.method()
+    all_di_maps: dict[str, dict[str, str]] = {}
+    all_di_calls: list[dict] = []
+    for result in per_file:
+        all_di_maps.update(result.get("di_maps", {}))
+        all_di_calls.extend(result.get("raw_di_calls", []))
+
+    if all_di_calls and all_di_maps:
+        # Build global class-name → {method_name: method_nid} map
+        class_methods: dict[str, dict[str, str]] = {}
+        for n in all_nodes:
+            label = n.get("label", "")
+            nid = n["id"]
+            # Method labels are now "ClassName.method_name()" or legacy ".method_name()"
+            if label.endswith("()") and "." in label:
+                # Extract method_name from either "ClassName.method()" or ".method()"
+                method_name = label.rsplit(".", 1)[1].rstrip("()")
+                # Find parent class by checking if nid starts with a known class nid
+                for cn in all_nodes:
+                    cn_label = cn.get("label", "")
+                    cn_nid = cn["id"]
+                    if ("." not in cn_label and not cn_label.endswith("()")
+                            and nid.startswith(cn_nid + "_")):
+                        class_methods.setdefault(cn_label, {})[method_name] = nid
+                        break
+
+        for dc in all_di_calls:
+            caller_nid = dc["caller_nid"]
+            receiver_field = dc["receiver_field"]
+            method_name = dc["method"]
+
+            # Find which class the caller belongs to (walk up from method nid)
+            caller_class_nid: str | None = None
+            for class_nid in all_di_maps:
+                if caller_nid.startswith(class_nid + "_") or caller_nid == class_nid:
+                    caller_class_nid = class_nid
+                    break
+
+            if not caller_class_nid:
+                continue
+
+            di_map = all_di_maps.get(caller_class_nid, {})
+            target_type = di_map.get(receiver_field)
+            if not target_type:
+                continue
+
+            # Find target method nid
+            target_methods = class_methods.get(target_type, {})
+            target_method_nid = target_methods.get(method_name)
+            if target_method_nid and target_method_nid != caller_nid:
+                pair = (caller_nid, target_method_nid)
+                if pair not in existing_pairs:
+                    existing_pairs.add(pair)
+                    all_edges.append({
+                        "source": caller_nid,
+                        "target": target_method_nid,
+                        "relation": "calls",
+                        "confidence": "EXTRACTED",
+                        "confidence_score": 1.0,
+                        "source_file": dc.get("source_file", ""),
+                        "source_location": dc.get("source_location"),
+                        "weight": 1.0,
+                    })
+
+    # Hard exclusion: remove framework noise nodes entirely (node + all edges)
+    _EXCLUDED_LABELS = frozenset({"LoggerService", "PrismaPostgresService", "RedisLockService"})
+    excluded_nids = {n["id"] for n in all_nodes if n.get("label") in _EXCLUDED_LABELS}
+    if excluded_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in excluded_nids]
+        all_edges = [e for e in all_edges if e["source"] not in excluded_nids and e["target"] not in excluded_nids]
+
+    # Drop constructor nodes entirely — they add no navigational value.
+    # DI information is already captured via injects edges on the class node.
+    constructor_nids: set[str] = set()
+    for n in all_nodes:
+        label = n.get("label", "")
+        if label.endswith(".constructor()"):
+            constructor_nids.add(n["id"])
+    if constructor_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in constructor_nids]
+        all_edges = [e for e in all_edges if e["source"] not in constructor_nids and e["target"] not in constructor_nids]
+
+    # Prune leaf method nodes: methods whose only edge is the "method" link to
+    # their parent class add no cross-class navigational value and create a
+    # gray blob of isolated nodes in graph visualisations.
+    edge_index: dict[str, list[dict]] = {}
+    for e in all_edges:
+        edge_index.setdefault(e["source"], []).append(e)
+        edge_index.setdefault(e["target"], []).append(e)
+    leaf_method_nids: set[str] = set()
+    for n in all_nodes:
+        nid = n["id"]
+        label = n.get("label", "")
+        if "." not in label or not label.endswith("()"):
+            continue
+        edges_for_node = edge_index.get(nid, [])
+        if len(edges_for_node) <= 1 and all(e.get("relation") == "method" for e in edges_for_node):
+            leaf_method_nids.add(nid)
+    if leaf_method_nids:
+        all_nodes = [n for n in all_nodes if n["id"] not in leaf_method_nids]
+        all_edges = [e for e in all_edges if e["source"] not in leaf_method_nids and e["target"] not in leaf_method_nids]
 
     return {
         "nodes": all_nodes,
